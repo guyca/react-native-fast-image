@@ -3,24 +3,23 @@ package com.dylanvann.fastimage;
 import android.graphics.Color;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
+import android.support.annotation.NonNull;
+import android.util.Log;
 import android.widget.ImageView;
 import android.widget.ImageView.ScaleType;
 
-import com.bumptech.glide.DrawableRequestBuilder;
-import com.bumptech.glide.DrawableTypeRequest;
 import com.bumptech.glide.Glide;
 import com.bumptech.glide.Priority;
-import com.bumptech.glide.RequestManager;
-import com.bumptech.glide.load.data.DataFetcher;
+import com.bumptech.glide.load.DataSource;
+import com.bumptech.glide.load.engine.DiskCacheStrategy;
+import com.bumptech.glide.load.engine.GlideException;
 import com.bumptech.glide.load.model.GlideUrl;
 import com.bumptech.glide.load.model.LazyHeaders;
-import com.bumptech.glide.load.model.stream.StreamModelLoader;
-import com.bumptech.glide.load.resource.drawable.GlideDrawable;
 import com.bumptech.glide.request.RequestListener;
+import com.bumptech.glide.request.RequestOptions;
 import com.bumptech.glide.request.target.ImageViewTarget;
 import com.bumptech.glide.request.target.Target;
-import com.bumptech.glide.signature.StringSignature;
-import com.facebook.react.bridge.NoSuchKeyException;
+import com.bumptech.glide.request.target.ViewTarget;
 import com.facebook.react.bridge.ReadableMap;
 import com.facebook.react.bridge.ReadableMapKeySetIterator;
 import com.facebook.react.bridge.WritableMap;
@@ -31,16 +30,13 @@ import com.facebook.react.uimanager.ThemedReactContext;
 import com.facebook.react.uimanager.annotations.ReactProp;
 import com.facebook.react.uimanager.events.RCTEventEmitter;
 
-import java.io.IOException;
-import java.io.InputStream;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.UUID;
 
 import javax.annotation.Nullable;
 
 class FastImageViewManager extends SimpleViewManager<ImageView> {
-
+    private static final String TAG = "FastImageViewManager";
     private static final String REACT_CLASS = "FastImageView";
 
     private static final String REACT_ON_LOAD_EVENT = "onFastImageLoad";
@@ -74,18 +70,14 @@ class FastImageViewManager extends SimpleViewManager<ImageView> {
         return new ImageView(reactContext);
     }
 
-    private static RequestListener<GlideUrl, GlideDrawable> LISTENER = new RequestListener<GlideUrl, GlideDrawable>() {
+    private static class LoadListener implements RequestListener<Drawable> {
         @Override
-        public boolean onException(
-                Exception e,
-                GlideUrl uri,
-                Target<GlideDrawable> target,
-                boolean isFirstResource
-        ) {
+        public boolean onLoadFailed(@android.support.annotation.Nullable GlideException e, Object model, Target<Drawable> target, boolean isFirstResource) {
+            Log.e(TAG, "onLoadFailed: ");
             if (!(target instanceof ImageViewTarget)) {
                 return false;
             }
-            ImageView view = (ImageView) ((ImageViewTarget) target).getView();
+            ImageView view = (ImageView) ((ViewTarget) target).getView();
             WritableMap event = new WritableNativeMap();
             ThemedReactContext context = (ThemedReactContext) view.getContext();
             RCTEventEmitter eventEmitter = context.getJSModule(RCTEventEmitter.class);
@@ -95,17 +87,12 @@ class FastImageViewManager extends SimpleViewManager<ImageView> {
         }
 
         @Override
-        public boolean onResourceReady(
-                GlideDrawable resource,
-                GlideUrl uri,
-                Target<GlideDrawable> target,
-                boolean isFromMemoryCache,
-                boolean isFirstResource
-        ) {
+        public boolean onResourceReady(Drawable resource, Object model, Target<Drawable> target, DataSource dataSource, boolean isFirstResource) {
+            Log.d(TAG, "onResourceReady: [" + dataSource + "]");
             if (!(target instanceof ImageViewTarget)) {
                 return false;
             }
-            ImageView view = (ImageView) ((ImageViewTarget) target).getView();
+            ImageView view = (ImageView) ((ViewTarget) target).getView();
             WritableMap event = new WritableNativeMap();
             ThemedReactContext context = (ThemedReactContext) view.getContext();
             RCTEventEmitter eventEmitter = context.getJSModule(RCTEventEmitter.class);
@@ -113,57 +100,52 @@ class FastImageViewManager extends SimpleViewManager<ImageView> {
             eventEmitter.receiveEvent(viewId, REACT_ON_LOAD_EVENT, event);
             return false;
         }
-    };
+    }
 
     @ReactProp(name = "source")
-    public void setSrc(ImageView view, @Nullable ReadableMap source) {
+    public void setSrc(final ImageView view, @Nullable ReadableMap source) {
         if (source == null) {
-            // Cancel existing requests.
-            Glide.clear(view);
-            // Clear the image.
+            cancelExistingRequests(view);
             view.setImageDrawable(null);
             return;
         }
 
         final String uriProp = source.getString("uri");
-
-        // Get the headers prop and add to glideUrl.
-        GlideUrl glideUrl;
-        try {
-            final ReadableMap headersMap = source.getMap("headers");
-            ReadableMapKeySetIterator headersIterator = headersMap.keySetIterator();
-            LazyHeaders.Builder headersBuilder = new LazyHeaders.Builder();
-            while (headersIterator.hasNextKey()) {
-                String key = headersIterator.nextKey();
-                String value = headersMap.getString(key);
-                headersBuilder.addHeader(key, value);
-            }
-            LazyHeaders headers = headersBuilder.build();
-            glideUrl = new GlideUrl(uriProp, headers);
-        } catch (NoSuchKeyException e) {
-            // If there is no headers object.
-            glideUrl = new GlideUrl(uriProp);
-        }
-
-        // Get the priority prop.
-        String priorityProp = "normal";
-        try {
-            priorityProp = source.getString("priority");
-        } catch (Exception e) {
-            // Noop.
-        }
+        final GlideUrl glideUrl = source.hasKey("headers") ? createUrlWithHeaders(source, uriProp) : new GlideUrl(uriProp);
+        String priorityProp = source.hasKey("priority") ? source.getString("priority") : "normal";
         final Priority priority = REACT_PRIORITY_MAP.get(priorityProp);
 
-        // Cancel existing request.
-        Glide.clear(view);
+        RequestOptions options = new RequestOptions()
+                .priority(priority)
+                .placeholder(TRANSPARENT_DRAWABLE)
+                .diskCacheStrategy(DiskCacheStrategy.ALL);
+        Log.i(TAG, "loading: " + uriProp + "\nwidth:" + view.getWidth() + " height: " + view.getHeight());
+        Glide.with(view.getContext())
+                .load(glideUrl)
+                .apply(options)
+                .listener(new LoadListener())
+                .into(view);
+    }
 
-        Glide
-                    .with(view.getContext())
-                    .load(glideUrl)
-                    .priority(priority)
-                    .placeholder(TRANSPARENT_DRAWABLE)
-                    .listener(LISTENER)
-                    .into(view);
+    private void cancelExistingRequests(@Nullable ImageView view) {
+        if (view != null) {
+            Log.e(TAG, "cancelExistingRequests");
+            Glide.with(view.getContext()).clear(view);
+        }
+    }
+
+    @NonNull
+    private GlideUrl createUrlWithHeaders(ReadableMap source, String uriProp) {
+        final ReadableMap headersMap = source.getMap("headers");
+        ReadableMapKeySetIterator headersIterator = headersMap.keySetIterator();
+        LazyHeaders.Builder headersBuilder = new LazyHeaders.Builder();
+        while (headersIterator.hasNextKey()) {
+            String key = headersIterator.nextKey();
+            String value = headersMap.getString(key);
+            headersBuilder.addHeader(key, value);
+        }
+        LazyHeaders headers = headersBuilder.build();
+        return new GlideUrl(uriProp, headers);
     }
 
     @ReactProp(name = "resizeMode")
@@ -175,8 +157,7 @@ class FastImageViewManager extends SimpleViewManager<ImageView> {
 
     @Override
     public void onDropViewInstance(ImageView view) {
-        // This will cancel existing requests.
-        Glide.clear(view);
+        cancelExistingRequests(view);
         super.onDropViewInstance(view);
     }
 
@@ -190,32 +171,4 @@ class FastImageViewManager extends SimpleViewManager<ImageView> {
                 MapBuilder.of("registrationName", REACT_ON_ERROR_EVENT)
         );
     }
-
-    // Used to attempt to load from cache only.
-    private static final StreamModelLoader<GlideUrl> cacheOnlyStreamLoader = new StreamModelLoader<GlideUrl>() {
-        @Override
-        public DataFetcher<InputStream> getResourceFetcher(final GlideUrl model, int width, int height) {
-            return new DataFetcher<InputStream>() {
-                @Override
-                public InputStream loadData(Priority priority) throws Exception {
-                    throw new IOException();
-                }
-
-                @Override
-                public void cleanup() {
-
-                }
-
-                @Override
-                public String getId() {
-                    return model.getCacheKey();
-                }
-
-                @Override
-                public void cancel() {
-
-                }
-            };
-        }
-    };
 }
